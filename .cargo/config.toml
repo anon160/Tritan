@@ -1,0 +1,13 @@
+[build]
+# Target for 64-bit RISC-V (QEMU virt machine)
+target = "riscv64gc-unknown-none-elf"
+
+[target.riscv64gc-unknown-none-elf]
+rustflags = [
+    "-C", "link-arg=-Tlinker.ld",
+]
+
+
+
+[run]
+runner = "qemu-system-riscv64 -machine virt -m 128M -bios none -nographic -serial mon:stdio -kernel"
