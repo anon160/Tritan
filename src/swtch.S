@@ -5,6 +5,7 @@
 # Save current registers in old, then load registers from new.
 # a0 = old context pointer, a1 = new context pointer
 
+.section .text.swtch
 .globl swtch
 swtch:
     sd ra, 0(a0)

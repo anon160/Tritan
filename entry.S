@@ -1,40 +1,39 @@
-# entry.S
 .section .text.init
 .globl _start
 _start:
-    # 1. Setup a stack so we can perform the jump
-    la sp, boot_stack_top
+    # 1. Save Hart ID (provided by OpenSBI in a0)
+    mv tp, a0
 
-    # 2. Delegate interrupts and exceptions to S-mode.
-    # Without this, 'ecall' will try to jump to M-mode, bypassing your trampoline!
-    li t0, 0xffff
-    csrw medeleg, t0
-    csrw mideleg, t0
+    # 2. Setup a temporary stack for the wake-up logic
+    la sp, stack0
+    li t0, 4096
+    addi t1, a0, 1
+    mul t0, t0, t1
+    add sp, sp, t0
 
-    # 3. Configure mstatus to return into Supervisor Mode (S-mode)
-    # Bits 12:11 are MPP (Machine Previous Privilege). 
-    # We set them to 01 (Supervisor).
-    li t0, (1 << 11)
-    csrw mstatus, t0
+    # 3. If this is Hart 0, tell OpenSBI to start the other Harts
+    bnez a0, secondary_entry
 
-    # 4. Set the return address (mepc) to our Rust main function
-    la t1, main
-    csrw mepc, t1
+    # --- HART 0 ONLY: The Invitation Loop ---
+    # We'll try to wake Harts 1, 2, and 3
+    li s0, 1                # Target Hart ID starts at 1
+    li s1, 4                # Max Harts (matches -smp 4)
+wake_loop:
+    li a7, 0x48534D         # HSM Extension
+    li a6, 0                # Hart Start Function
+    mv a0, s0               # Hart to wake
+    la a1, _start           # Point them back to this entry code
+    li a2, 0                # Opaque value
+    ecall
+    
+    addi s0, s0, 1
+    blt s0, s1, wake_loop
 
-    # 5. Disable PMP (Physical Memory Protection)
-    # By default, some QEMU versions lock down all memory in M-mode.
-    # This gives S-mode full access to the entire 64-bit address space.
-    li t0, 0x3fffffffffffffff
-    csrw pmpaddr0, t0
-    li t0, 0xf
-    csrw pmpcfg0, t0
+secondary_entry:
+    # 4. All Harts (Original Hart 0 + newly woken Harts) jump to main
+    j main
 
-    # 6. "Return" from M-mode to S-mode
-    # This jumps to the address in 'mepc' (main) and switches to S-mode
-    mret
-
-.section .bss.stack
+.section .stack
 .align 16
-boot_stack:
+stack0:
     .space 4096 * 4
-boot_stack_top:

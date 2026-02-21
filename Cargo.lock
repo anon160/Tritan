@@ -87,6 +87,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3f2ad9f15a07f4a0e1677124f9120ce7e83ab7e1ca7186af0ca9da529b62e80"
 
 [[package]]
+name = "sbi-rt"
+version = "0.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fbaa69be1eedc61c426e6d489b2260482e928b465360576900d52d496a58bd0"
+dependencies = [
+ "sbi-spec",
+]
+
+[[package]]
+name = "sbi-spec"
+version = "0.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6e36312fb5ddc10d08ecdc65187402baba4ac34585cb9d1b78522ae2358d890"
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -127,6 +142,7 @@ version = "0.1.0"
 dependencies = [
  "buddy_system_allocator",
  "riscv",
+ "sbi-rt",
  "spin",
  "talc",
 ]

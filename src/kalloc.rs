@@ -1,5 +1,6 @@
 use buddy_system_allocator::LockedHeap;
 use core::ptr::{addr_of, write_bytes};
+use crate::println;
 
 pub static ALLOCATOR: LockedHeap<32> = LockedHeap::<32>::new();
 
@@ -48,7 +49,7 @@ pub fn kalloc() -> Option<*mut u8> {
 
 pub unsafe fn walk(pagetable: *mut u64, va: usize, alloc: bool) -> Option<*mut u64> {
     let mut table = pagetable;
-    for level in (1..3).rev() {
+    for level in (1..=2).rev() {
         let idx = (va >> (12 + level * 9)) & 0x1FF;
         let pte_ptr = table.add(idx);
         let pte = *pte_ptr;
@@ -85,16 +86,23 @@ pub unsafe fn mappages(pagetable: *mut u64, va: usize, pa: usize, size: usize, p
 }
 
 // --- PAGE TABLE CONSTRUCTORS ---
-pub unsafe fn uvmcreate() -> *mut u64 {
+pub unsafe fn uvmcreate(trapframe_pa: usize) -> *mut u64 {
     let root = kalloc().expect("Failed user root PT") as *mut u64;
+    
+    // 1. Map Trampoline (The code)
+    // Ensure trampoline_start is exactly what's in the kernel's physical memory
+    let trampoline_pa = trampoline_start as usize; 
+    mappages(root, TRAMPOLINE, trampoline_pa, PGSIZE, PTE_R | PTE_X);
 
-    // Map Trampoline and UART for kernel-mode operations while on user page table
-    mappages(root, TRAMPOLINE, trampoline_start as *const () as usize, PGSIZE, PTE_R | PTE_X);
+    // 2. Map Trapframe (The data storage for registers)
+    // You need to pass the physical address of the specific task's trapframe here
+    mappages(root, TRAPFRAME, trapframe_pa, PGSIZE, PTE_R | PTE_W);
+
+    // 3. Identity map UART for debugging
     mappages(root, 0x1000_0000, 0x1000_0000, PGSIZE, PTE_R | PTE_W);
 
-    // Identity map kernel RAM so the CPU doesn't fault during trap entry/exit
-    let kernel_start = 0x8000_0000;
-    mappages(root, kernel_start, kernel_start, 1024 * 1024 * 32, PTE_R | PTE_W | PTE_X);
+    // 4. Identity map the kernel section so we don't fault on the jump back
+    mappages(root, 0x8000_0000, 0x8000_0000, 1024 * 1024 * 32, PTE_R | PTE_W | PTE_X);
 
     root
 }
@@ -142,7 +150,7 @@ pub struct PageTable {
 }
 
 #[unsafe(link_section = ".data.boot_pt")]
-static mut KERNEL_BOOT_PT: PageTable = PageTable { entries: [0; 512] };
+pub static mut KERNEL_BOOT_PT: PageTable = PageTable { entries: [0; 512] };
 
 pub unsafe fn kpvminit() -> usize {
     let root = &raw mut KERNEL_BOOT_PT.entries as *mut u64;

@@ -5,6 +5,12 @@ target = "riscv64gc-unknown-none-elf"
 [target.riscv64gc-unknown-none-elf]
 rustflags = [
     "-C", "link-arg=-Tlinker.ld",
+    "-C", "code-model=medium",        # <--- ADD THIS
+  "-C", "relocation-model=static",  # <--- ADD THIS
+  "-C", "link-arg=--relax",
+  "-C", "link-arg=-z", 
+  "-C", "link-arg=noexecstack",
+  "-C", "force-frame-pointers=yes"
 ]
 
 

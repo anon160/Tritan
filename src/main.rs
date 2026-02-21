@@ -5,105 +5,154 @@ mod trap;
 mod kalloc; 
 mod console;
 mod syscall;
+mod cpu;
+mod sched;
+mod panic;
 
 extern crate alloc; 
 
-use core::{arch::global_asm, panic::PanicInfo};
+use core::arch::global_asm;
 use spin::Mutex;
 use talc::{Talck, Talc, Span};
-use riscv::register::{stvec::{self, Stvec, TrapMode}, sstatus, sscratch, mhartid};
+use riscv::register::{stvec::{self, Stvec, TrapMode}, sstatus, sscratch};
 
-// Import constants
-use crate::kalloc::{kinit, kalloc, TRAMPOLINE, TRAPFRAME, PGSIZE, kmap, kpvminit};
+// Updated Imports
+use crate::cpu::{cpu_init, timer_init, my_cpu}; // Added my_cpu
+use crate::sched::{SCHEDULER, ExecMode, Task, scheduler};
+use crate::kalloc::{kinit, kalloc, TRAMPOLINE, TRAPFRAME, PGSIZE, kpvminit};
 use crate::trap::{TrapFrame, rust_trap_handler};
 
-global_asm!(include_str!("trampoline.S"));
 global_asm!(include_str!("../entry.S"));
+global_asm!(include_str!("swtch.S"));
 
 #[global_allocator]
 static ALLOCATOR: Talck<Mutex<()>, talc::ErrOnOom> = Talc::new(talc::ErrOnOom).lock();
 
-pub static USER_SATP: Mutex<usize> = Mutex::new(0);
-
 #[unsafe(no_mangle)]
+#[unsafe(link_section = ".text.main")]
 pub extern "C" fn main() -> ! {
-    // --- Phase 1: Physical Foundations ---
-    kinit();
+    // 1. Get the raw Hart ID from 'tp' (where entry.S put it)
+    let id: usize;
+    unsafe { core::arch::asm!("mv {}, tp", out(reg) id); }
     
-    // Initialize Heap
-    let heap_phys = kalloc().expect("Failed to allocate heap");
+    // 2. Initialize the CPU struct (Anchors 'tp' to the Cpu struct pointer)
     unsafe {
-        let _ = ALLOCATOR.lock().claim(Span::from_base_size(heap_phys, 1024 * 1024));
+        cpu_init(id); 
+    }
+
+    // Now we can safely use the high-level my_cpu() helper
+    let cpu = unsafe { my_cpu() };
+    let hartid = cpu.id();
+
+    if hartid == 0 {
+        kinit();
+        let heap_phys = kalloc().expect("Heap alloc failed");
+        unsafe {
+            let _ = ALLOCATOR.lock().claim(Span::from_base_size(heap_phys, 1024 * 1024));
+        }
+        info!("Tritan OS: Global Hardware Initialized.");
     }
     
-    println!("Tritan OS: Basic Hardware Initialized.");
 
-    // --- Phase 2: Virtual Memory ---
-    // We move the messy paging code to vm.rs
-    let kernel_satp = unsafe { kpvminit() };
-    println!("Virtual Memory: Enabled.");
+    unsafe {
+        kpvminit();             
+        setup_trap_vectors();  
+        timer_init();           
+    }
 
-    // --- Phase 3: Trap & User Setup ---
-    setup_trap_vectors();
+    if hartid == 0 {
+        let kernel_satp = (8usize << 60) | (unsafe { crate::kalloc::KERNEL_BOOT_PT.entries.as_ptr() as usize >> 12 });
+        
+        let (user_satp, tf_ptr) = unsafe { setup_user_test(kernel_satp) };
+        
+        let first_task = Task::spawn(
+            "init_task1", 
+            ExecMode::Sync, 
+            tf_ptr,      
+            user_satp    
+        );
+        let sec_task = Task::spawn(
+            "init_task2", 
+            ExecMode::Sync, 
+            tf_ptr,      
+            user_satp    
+        );
+        SCHEDULER.lock().run_queue.insert(sec_task.vruntime, sec_task);
+        SCHEDULER.lock().run_queue.insert(first_task.vruntime, first_task);
+        info!("Initial tasks spawned into B-Tree.");
+    }
+    info!("Hart {} entering scheduler...", hartid);
+    scheduler();
+}
+
+
+
+unsafe fn setup_user_test(k_satp: usize) -> (usize, *mut TrapFrame) {
+    use crate::kalloc::{uvmcreate, uvmmapcode, mappages, PTE_R, PTE_W, PTE_U, PTE_X};
     
-    // Temporary: Still manual user entry for now until Scheduler is ready
-    let user_satp = unsafe { setup_user_test(kernel_satp) };
-    *USER_SATP.lock() = user_satp;
+    let trapframe_ptr = kalloc().expect("Failed to allocate trapframe") as *mut TrapFrame;
+    let trapframe_pa = trapframe_ptr as usize;
 
-    println!("Dropping to User Mode...");
-    unsafe { drop_to_user(user_satp); }
+    // 1. Create the page table
+    let user_pt = uvmcreate(trapframe_pa);
+
+    // --- THE CRITICAL MISSING PIECES ---
+    
+    // 2. Map the TRAMPOLINE (The code that handles the switch)
+    // It MUST be at the same virtual address (0x4000000000) as in the kernel.
+    extern "C" { fn trampoline_start(); }
+    mappages(
+        user_pt, 
+        TRAMPOLINE, 
+        trampoline_start as usize, 
+        PGSIZE, 
+        (PTE_R | PTE_X) as u64 // Read + Execute
+    );
+
+    // 3. Map the TRAPFRAME (Where registers are saved)
+    // It MUST be mapped at the TRAPFRAME virtual address.
+    mappages(
+        user_pt, 
+        TRAPFRAME, 
+        trapframe_pa, 
+        PGSIZE, 
+        (PTE_R | PTE_W) as u64 // Read + Write
+    );
+    
+    mappages(
+        user_pt, 
+        TRAPFRAME,          // 0x3fffffe000
+        trapframe_pa,       // Physical address
+        PGSIZE, 
+        (PTE_R | PTE_W) as u64 // Read + Write
+    );
+    // --- END OF CRITICAL FIXES ---
+
+    let user_satp = (8usize << 60) | ((user_pt as usize) >> 12);
+    core::ptr::write_bytes(trapframe_ptr as *mut u8, 0, PGSIZE);
+    
+    let kstack = kalloc().expect("KStack alloc failed");
+    (*trapframe_ptr).kernel_satp = k_satp;
+    (*trapframe_ptr).kernel_sp = kstack as usize + PGSIZE; 
+    (*trapframe_ptr).kernel_trap = rust_trap_handler as *const () as usize;
+    (*trapframe_ptr).epc = 0x1000; 
+    (*trapframe_ptr).user_satp = user_satp;
+    (*trapframe_ptr).regs[2] = 0x8000_0000; 
+
+    uvmmapcode(user_pt, 0x1000, user_code as *const u8, PGSIZE);
+    
+    let user_stack = kalloc().expect("User stack alloc failed");
+    mappages(user_pt, 0x8000_0000 - PGSIZE, user_stack as usize, PGSIZE, (PTE_R | PTE_W | PTE_U) as u64);
+
+    (user_satp, trapframe_ptr) 
 }
 
 fn setup_trap_vectors() {
     unsafe {
-        stvec::write(Stvec::new(TRAMPOLINE, TrapMode::Direct));
+        // TRAPFRAME is the Virtual Address 0x3fffffe000
         sscratch::write(TRAPFRAME);
+        stvec::write(Stvec::new(TRAMPOLINE, TrapMode::Direct));
     }
-}
-
-unsafe fn drop_to_user(satp_val: usize) -> ! {
-    let mut s = sstatus::read();
-    s.set_spp(sstatus::SPP::User); 
-    s.set_spie(true);
-    sstatus::write(s);
-
-    core::arch::asm!("fence rw, rw", "sfence.vma zero, zero");
-
-    extern "C" { fn userret(tf: usize, satp: usize); }
-    let userret_offset = (userret as *const () as usize) - (crate::kalloc::trampoline_start as *const () as usize);
-    let userret_va = TRAMPOLINE + userret_offset;
-    let func: extern "C" fn(usize, usize) = core::mem::transmute(userret_va);
-    
-    func(TRAPFRAME, satp_val);
-    loop {}
-}
-// Helper for the user test code you currently have
-unsafe fn setup_user_test(k_satp: usize) -> usize {
-    use crate::kalloc::{uvmcreate, uvmmapcode, mappages, PTE_R, PTE_W, PTE_U};
-    
-    let tf_ptr = kalloc().expect("TF alloc failed") as *mut TrapFrame;
-    let kstack = kalloc().expect("KStack alloc failed");
-    let user_stack = kalloc().expect("User stack alloc failed");
-    
-    // FIX: Cast (PTE_R | PTE_W) to usize
-    kmap(TRAPFRAME, tf_ptr as usize, PGSIZE, (PTE_R | PTE_W) as usize);
-
-    let user_pt = uvmcreate();
-    let user_satp = (8usize << 60) | ((user_pt as usize) >> 12);
-
-    core::ptr::write_bytes(tf_ptr as *mut u8, 0, PGSIZE);
-    (*tf_ptr).kernel_satp = k_satp;
-    (*tf_ptr).kernel_sp = kstack as usize + PGSIZE; 
-    (*tf_ptr).kernel_trap = rust_trap_handler as *const () as usize;
-    (*tf_ptr).epc = 0x1000; 
-    (*tf_ptr).user_satp = user_satp;
-    (*tf_ptr).regs[2] = 0x8000_0000; // SP
-
-    uvmmapcode(user_pt, 0x1000, user_code as *const u8, PGSIZE);
-    mappages(user_pt, 0x8000_0000 - PGSIZE, user_stack as usize, PGSIZE, (PTE_R | PTE_W | PTE_U) as u64);
-    mappages(user_pt, TRAPFRAME, tf_ptr as usize, PGSIZE, (PTE_R | PTE_W) as u64);
-    
-    user_satp
 }
 
 #[unsafe(no_mangle)]
@@ -119,23 +168,4 @@ pub fn user_code() -> ! {
             options(noreturn)
         );
     }
-}
-
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    let hart = mhartid::read();
-    println!("\n\x1b[31;1m!!!!!!!!!!!!!!!! KERNEL PANIC !!!!!!!!!!!!!!!!\x1b[0m");
-    println!("\x1b[33mHart ID:\x1b[0m {}", hart);
-    println!("\x1b[33mLocation:\x1b[0m {}", info.location().unwrap_or(core::panic::Location::caller()));
-    println!("\x1b[33mMessage:\x1b[0m {}", info.message());
-    
-    // Capture some register state for context
-    let scause = riscv::register::scause::read();
-    let stval = riscv::register::stval::read();
-    let sepc = riscv::register::sepc::read();
-    
-    println!("\x1b[34mTrap Context:\x1b[0m scause={:#x}, stval={:#x}, sepc={:#x}", scause.bits(), stval, sepc);
-    println!("\x1b[31;1m!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\x1b[0m\n");
-    
-    loop {}
 }
