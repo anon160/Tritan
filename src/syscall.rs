@@ -1,4 +1,4 @@
-use crate::{print, syscall, println, TrapFrame};
+use crate::{print, println, TrapFrame};
 
 pub fn handle_print_str(user_satp: usize, va: usize) {
     // Convert the satp value (which contains the PPN) into a raw pointer

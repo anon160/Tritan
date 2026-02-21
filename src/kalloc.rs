@@ -135,3 +135,36 @@ pub unsafe fn walk_addr(pagetable: *mut u64, va: usize) -> usize {
     
     pa as usize // Cast back to usize for the return
 }
+
+#[repr(align(4096))]
+pub struct PageTable {
+    pub entries: [u64; 512],
+}
+
+#[unsafe(link_section = ".data.boot_pt")]
+static mut KERNEL_BOOT_PT: PageTable = PageTable { entries: [0; 512] };
+
+pub unsafe fn kpvminit() -> usize {
+    let root = &raw mut KERNEL_BOOT_PT.entries as *mut u64;
+    core::ptr::write_bytes(root as *mut u8, 0, 4096);
+    
+    // Identity map UART & Kernel RAM
+    mappages(root, 0x1000_0000, 0x1000_0000, PGSIZE, PTE_R | PTE_W);
+    mappages(root, 0x8000_0000, 0x8000_0000, 1024 * 1024 * 32, PTE_R | PTE_W | PTE_X);
+    
+    extern "C" { fn trampoline_start(); }
+    mappages(root, TRAMPOLINE, trampoline_start as *const () as usize, PGSIZE, PTE_R | PTE_X);
+    
+    let satp_val = (8usize << 60) | ((root as usize) >> 12);
+    
+    riscv::register::sstatus::set_sum();
+    riscv::register::satp::write(riscv::register::satp::Satp::from_bits(satp_val));
+    core::arch::asm!("sfence.vma zero, zero", "fence.i");
+    
+    satp_val
+}
+
+pub unsafe fn kmap(va: usize, pa: usize, size: usize, perm: usize) {
+    let root = &raw mut KERNEL_BOOT_PT.entries as *mut u64;
+    mappages(root, va, pa, size, perm as u64);
+}
