@@ -1,19 +1,22 @@
 use core::fmt::{self, Write};
 use spin::Mutex;
+use crate::dtb;
 
-pub struct Uart(usize);
-
-unsafe impl Send for Uart {}
-unsafe impl Sync for Uart {}
+pub struct Uart;
 
 impl Uart {
-    pub const fn new(addr: usize) -> Self { 
-        Self(addr) 
+    /// Returns the current hardware address for the UART.
+    /// It queries the DTB config, falling back to the QEMU default if not yet init.
+    fn addr(&self) -> usize {
+        dtb::get_uart_addr()
     }
 
     pub fn putc(&self, c: u8) {
-        let ptr = self.0 as *mut u8;
-        unsafe { ptr.write_volatile(c); }
+        let ptr = self.addr() as *mut u8;
+        unsafe {
+            // Standard 8250/16550a UART: Write to the Transmitter Holding Register (THR)
+            ptr.write_volatile(c);
+        }
     }
 }
 
@@ -26,10 +29,16 @@ impl fmt::Write for Uart {
     }
 }
 
-pub static PANIC_UART: Mutex<Uart> = Mutex::new(Uart::new(0x1000_0000));
+/// We no longer need to store the address inside the Uart struct.
+/// The address is fetched dynamically from the DTB module.
+pub static PANIC_UART: Mutex<Uart> = Mutex::new(Uart);
 
 pub fn _print(args: fmt::Arguments) {
-    PANIC_UART.lock().write_fmt(args).unwrap();
+    // Note: In a multicore system, this Mutex prevents Harts from 
+    // scrambling each other's characters in the serial output.
+    if let Some(mut guard) = PANIC_UART.try_lock() {
+        guard.write_fmt(args).unwrap();
+    }
 }
 
 // --- Basic Print Macros ---

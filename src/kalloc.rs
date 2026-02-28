@@ -1,11 +1,10 @@
 use buddy_system_allocator::LockedHeap;
 use core::ptr::{addr_of, write_bytes};
-use crate::println;
+use crate::dtb; 
 
 pub static ALLOCATOR: LockedHeap<32> = LockedHeap::<32>::new();
 
 pub const PGSIZE: usize = 4096;
-pub const PHYSTOP: usize = 0x80000000 + (120 * 1024 * 1024);
 
 // --- Sv39 Page Table Entry Bits ---
 pub const PTE_V: u64 = 1 << 0; 
@@ -29,7 +28,10 @@ unsafe extern "C" {
 pub fn kinit() {
     let start = addr_of!(__ebss) as usize;
     let page_aligned_start = (start + PGSIZE - 1) & !(PGSIZE - 1);
-    let size = PHYSTOP - page_aligned_start;
+    
+    // Dynamically calculate PHYSTOP from DTB
+    let phystop = dtb::get_phystop();
+    let size = phystop - page_aligned_start;
 
     unsafe {
         ALLOCATOR.lock().init(page_aligned_start, size);
@@ -59,8 +61,6 @@ pub unsafe fn walk(pagetable: *mut u64, va: usize, alloc: bool) -> Option<*mut u
         } else {
             if !alloc { return None; }
             let new_page = kalloc().expect("Walk: kalloc failed");
-            
-            // Non-leaf (directory) entries should only have PTE_V.
             *pte_ptr = ((new_page as u64 >> 12) << 10) | PTE_V;
             table = new_page as *mut u64;
         }
@@ -75,8 +75,6 @@ pub unsafe fn mappages(pagetable: *mut u64, va: usize, pa: usize, size: usize, p
 
     loop {
         let pte = walk(pagetable, curr_va, true).expect("mappages: walk failed");
-        
-        // Leaf nodes need V, A, D, and the requested permissions.
         *pte = ((curr_pa as u64 >> 12) << 10) | perm | PTE_V | PTE_A | PTE_D;
 
         if curr_va == last_va { break; }
@@ -85,23 +83,42 @@ pub unsafe fn mappages(pagetable: *mut u64, va: usize, pa: usize, size: usize, p
     }
 }
 
+pub unsafe fn walk_addr(pagetable: *mut u64, va: usize) -> usize {
+    let mut table = pagetable;
+    let va_u64 = va as u64;
+
+    for level in (1..=2).rev() {
+        let vpn = ((va_u64 >> (12 + 9 * level)) & 0x1FF) as usize;
+        let pte = *table.add(vpn);
+        if (pte & PTE_V) == 0 { return 0; }
+        table = ((pte >> 10) << 12) as *mut u64;
+    }
+
+    let vpn0 = ((va_u64 >> 12) & 0x1FF) as usize;
+    let pte = *table.add(vpn0);
+    if (pte & PTE_V) == 0 { return 0; }
+    (((pte >> 10) << 12) | (va_u64 & 0xFFF)) as usize
+}
+
+pub unsafe fn kmap_dtb(dtb_pa: usize) {
+    let root = &raw mut KERNEL_BOOT_PT.entries as *mut u64;
+    mappages(root, dtb_pa, dtb_pa, 128 * 1024, PTE_R);
+}
+
 // --- PAGE TABLE CONSTRUCTORS ---
+
 pub unsafe fn uvmcreate(trapframe_pa: usize) -> *mut u64 {
     let root = kalloc().expect("Failed user root PT") as *mut u64;
-    
-    // 1. Map Trampoline (The code)
-    // Ensure trampoline_start is exactly what's in the kernel's physical memory
     let trampoline_pa = trampoline_start as usize; 
+    let uart_addr = dtb::get_uart_addr();
+    
     mappages(root, TRAMPOLINE, trampoline_pa, PGSIZE, PTE_R | PTE_X);
-
-    // 2. Map Trapframe (The data storage for registers)
-    // You need to pass the physical address of the specific task's trapframe here
     mappages(root, TRAPFRAME, trapframe_pa, PGSIZE, PTE_R | PTE_W);
-
-    // 3. Identity map UART for debugging
-    mappages(root, 0x1000_0000, 0x1000_0000, PGSIZE, PTE_R | PTE_W);
-
-    // 4. Identity map the kernel section so we don't fault on the jump back
+    
+    // Map UART based on discovery
+    mappages(root, uart_addr, uart_addr, PGSIZE, PTE_R | PTE_W);
+    
+    // Identity map kernel section
     mappages(root, 0x8000_0000, 0x8000_0000, 1024 * 1024 * 32, PTE_R | PTE_W | PTE_X);
 
     root
@@ -111,37 +128,7 @@ pub unsafe fn uvmmapcode(pagetable: *mut u64, va: usize, src: *const u8, len: us
     if len > PGSIZE { panic!("uvmmapcode: code too large"); }
     let mem = kalloc().expect("uvmmapcode: kalloc failed");
     core::ptr::copy_nonoverlapping(src, mem, len);
-    
-    // User code must have PTE_U to be executable in U-mode
     mappages(pagetable, va, mem as usize, PGSIZE, PTE_R | PTE_X | PTE_U);
-}
-
-pub unsafe fn walk_addr(pagetable: *mut u64, va: usize) -> usize {
-    let mut table = pagetable;
-    let va_u64 = va as u64; // Convert once for easier math
-
-    // Sv39 has 3 levels: VPN[2], VPN[1], VPN[0]
-    for level in (1..=2).rev() {
-        let vpn = ((va_u64 >> (12 + 9 * level)) & 0x1FF) as usize;
-        let pte = *table.add(vpn);
-
-        if (pte & 1) == 0 { 
-            return 0; // Page not present
-        }
-
-        // Extract PPN from PTE and move to next level
-        table = ((pte >> 10) << 12) as *mut u64;
-    }
-
-    let vpn0 = ((va_u64 >> 12) & 0x1FF) as usize;
-    let pte = *table.add(vpn0);
-    
-    if (pte & 1) == 0 { return 0; }
-
-    // Math: (PPN << 12) | (Page Offset)
-    let pa = ((pte >> 10) << 12) | (va_u64 & 0xFFF);
-    
-    pa as usize // Cast back to usize for the return
 }
 
 #[repr(align(4096))]
@@ -152,16 +139,26 @@ pub struct PageTable {
 #[unsafe(link_section = ".data.boot_pt")]
 pub static mut KERNEL_BOOT_PT: PageTable = PageTable { entries: [0; 512] };
 
-pub unsafe fn kpvminit() -> usize {
+pub unsafe fn kpvminit(dtb_pa: usize) -> usize {
     let root = &raw mut KERNEL_BOOT_PT.entries as *mut u64;
     core::ptr::write_bytes(root as *mut u8, 0, 4096);
     
-    // Identity map UART & Kernel RAM
-    mappages(root, 0x1000_0000, 0x1000_0000, PGSIZE, PTE_R | PTE_W);
+    let uart_addr = dtb::get_uart_addr();
+    let plic_addr = dtb::HW_CONFIG.get().map(|c| c.plic_addr).unwrap_or(0x0c00_0000);
+    
+    // 1. Identity map Hardware
+    mappages(root, uart_addr, uart_addr, PGSIZE, PTE_R | PTE_W);
+    mappages(root, plic_addr, plic_addr, 0x400000, PTE_R | PTE_W); 
+    
+    // 2. Identity map Kernel RAM
     mappages(root, 0x8000_0000, 0x8000_0000, 1024 * 1024 * 32, PTE_R | PTE_W | PTE_X);
     
+    // 3. Map the Trampoline
     extern "C" { fn trampoline_start(); }
     mappages(root, TRAMPOLINE, trampoline_start as *const () as usize, PGSIZE, PTE_R | PTE_X);
+    
+    // 4. Map the DTB
+    kmap_dtb(dtb_pa);
     
     let satp_val = (8usize << 60) | ((root as usize) >> 12);
     
