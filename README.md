@@ -18,6 +18,6 @@ An experimental RISC-V kernel designed for learning and exploration, supporting 
 * Early-stage kernel — not production-ready
 
 ## Getting started
-* Clone this repo using git clone https://github.com/anon160/Tritan.git
+* Clone this repo using `git clone https://github.com/anon160/Tritan.git`
 * Build it using: `cargo build`.
 * Run using: `qemu-system-riscv64 -machine virt -cpu rv64 -m 6G -nographic -kernel target/riscv64gc-unknown-none-elf/debug/tritan -smp 2`
