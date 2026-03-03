@@ -16,4 +16,4 @@ rustflags = [
 
 
 [run]
-runner = "qemu-system-riscv64 -machine virt -m 128M -bios none -nographic -serial mon:stdio -kernel"
+runner = "qemu-system-riscv64 -machine virt -m 128M -nographic -serial mon:stdio -kernel"
