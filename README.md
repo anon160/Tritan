@@ -1,6 +1,6 @@
 # Tritan OS — Experimental RISC-V Kernel
 
-! Trian OS will be merged into (NOVIX OS)[https://github.com/Novice06/Novix/tree/main] soon
+! Trian OS will be merged into [NOVIX OS](https://github.com/Novice06/Novix/tree/main) soon
 
 An experimental RISC-V kernel designed for learning and exploration, supporting multi-hart booting, device tree parsing, and basic syscall output.
 
